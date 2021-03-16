@@ -1,0 +1,183 @@
+#!/bin/bash
+
+############################################################################
+#                                                                          #
+#  Name:           anyconnect_then_copy_file                               #
+#  Description:    It's in main()                                          #
+#  Arguments:      none                                                    #
+#  .ENV File:      VPN_GATEWAY: hostname                                   #
+#                  VPN_GROUP: number entered for vpn login                 #
+#                  VPN_USER: user entered for vpn login                    #
+#                  VPN_PASSWORD: password entered for vpn login            #
+#                  SMB_SERVER: hostname                                    #
+#                  SMB_DOMAIN: get via smbutil if needed                   #
+#                  SMB_USER: use shortname, not email                      #
+#                  SMB_PASSWORD: may need to be escaped                    #
+#                  SMB_SHARE: name of fileshare                            #
+#                  SOURCE_FILE_REL_PATH: to append to mount path           #
+#                  DESTINATION_FILE_ABS_PATH: on your system               #
+#                  ATTEMPTS_LIMIT: how many tries, per operation           #
+#                  TMP_SUBDIR: avoid collisions but use whatever you want  #
+#  Version:        1.0                                                     #
+#  Last Edited By: greg.sheppard@zones.com                                 #
+#  Date:           2021-03-16                                              #
+#  https://formulae.brew.sh/formula/boxes                                  #
+#                                                                          #
+############################################################################
+
+PATH='/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin'
+export PATH+=':/opt/cisco/anyconnect/bin/'
+
+shopt -s nocasematch
+
+cd "$(dirname "$0")" || exit 1
+
+function error() {
+  echo "[$(date '+%F %T%z')] ERROR: $*" >&2
+  exit 1
+}
+
+function log() {
+  echo "[$(date '+%F %T%z')] OUTPUT: $*"
+}
+
+function import_variables() {
+  if source .ENV; then
+    FILESHARE_MOUNT_DIR="$TMPDIR$TMP_SUBDIR"
+    SOURCE_FILE_ABSOLUTE="$FILESHARE_MOUNT_DIR/$SOURCE_FILE_REL_PATH"
+    log "Imported '.ENV' file"
+  else
+    error "Could not import '.ENV' file"
+  fi
+}
+
+function smb_server_reachable() {
+  if nc -z "$SMB_SERVER" 139 &>/dev/null; then
+    # log "'$SMB_SERVER' reachable"
+    return 0
+  else
+    # log "'$SMB_SERVER' not reachable"
+    return 1
+  fi
+}
+
+function launch_vpn_service_if_needed() {
+  if ! smb_server_reachable; then
+    local attempts=0
+    while ! pgrep -flq /opt/cisco/anyconnect/bin/vpnagentd; do
+      ((attempts++))
+      if ((attempts == 1)); then
+        log "Attempting to launch 'com.cisco.anyconnect.vpnagentd'"
+      fi
+      sudo launchctl bootstrap system \
+        "/Library/LaunchDaemons/com.cisco.anyconnect.vpnagentd.plist"
+      sleep 1
+      if ((attempts == ATTEMPTS_LIMIT)); then
+        error "Could not launch anyconnect service after $attempts attempts"
+      fi
+    done
+    log "AnyConnect daemon is running"
+  fi
+}
+
+function vpn_state() {
+  vpn state |
+    awk '$3 == "state:" { print $4; exit }'
+}
+
+function connect_vpn() {
+  printf '%s\n%s\n%s\ny' "$VPN_GROUP" "$VPN_USER" "$VPN_PASSWORD" |
+    vpn -s connect "$VPN_GATEWAY"
+}
+
+function connect_to_vpn_if_needed() {
+  if ! smb_server_reachable; then
+    local attempts=0
+    while [[ "$(vpn_state)" != "connected" ]]; do
+      ((attempts++))
+      if ((attempts == 1)); then
+        log "Attempting to connect to  '$VPN_GATEWAY'"
+      fi
+      connect_vpn
+      sleep 1
+      if ((attempts == ATTEMPTS_LIMIT)); then
+        error "Could not connect to '$VPN_GATEWAY' after $attempts attempts"
+      fi
+    done
+    log "Connected to '$VPN_GATEWAY'"
+  fi
+}
+
+function mount_fileshare_if_needed() {
+  if smb_server_reachable; then
+    local attempts message
+    attempts=0
+    mkdir -p "$FILESHARE_MOUNT_DIR"
+    mount_match="//$SMB_DOMAIN;$SMB_USER@$SMB_SERVER/$SMB_SHARE on "
+    mount_match+="/private$FILESHARE_MOUNT_DIR"
+    mount | grep -lq "$mount_match"
+    while ! mount | grep -lq "$mount_match"; do
+      ((attempts++))
+      if ((attempts == 1)); then
+        message="Attempting to mount '//$SMB_DOMAIN;"
+        message+="$SMB_USER:[PASSWORD]@$SMB_SERVER/$SMB_SHARE'"
+        log "$message"
+      fi
+      mount -t smbfs -o nobrowse,nodev,nosuid,rdonly \
+        "//$SMB_DOMAIN;$SMB_USER:$SMB_PASSWORD@$SMB_SERVER/$SMB_SHARE" \
+        "$FILESHARE_MOUNT_DIR"
+      if ((attempts == ATTEMPTS_LIMIT)); then
+        error "Could not mount '$SMB_SERVER' after $attempts attempts"
+      fi
+      sleep 1
+    done
+  else
+    error "'$SMB_SERVER' is not reachable"
+  fi
+}
+
+function force_source_folder_to_load() {
+  ls -l "$SOURCE_FILE_ABSOLUTE" >/dev/null
+}
+
+function copy_file() {
+  force_source_folder_to_load
+  log "Copying '$SOURCE_FILE_ABSOLUTE' to '$DESTINATION_FILE_ABS_PATH'"
+  if ! cp \
+    "$SOURCE_FILE_ABSOLUTE" \
+    "$DESTINATION_FILE_ABS_PATH"; then
+    error "File copy failed but you should still be connected; try manually"
+  fi
+}
+
+function unmount_fileshare() {
+  log "Unmounting '$FILESHARE_MOUNT_DIR'"
+  if ! diskutil unmount force "$FILESHARE_MOUNT_DIR"; then
+    error "Failed to unmount '$FILESHARE_MOUNT_DIR'"
+  fi
+}
+
+function close_vpn_connection() {
+  log "Disconnecting '$VPN_GATEWAY'"
+  if ! vpn disconnect; then
+    error "Failed to disconnect '$VPN_GATEWAY'"
+  fi
+}
+
+function open_destination_folder() {
+  log "opening $(dirname "$DESTINATION_FILE_ABS_PATH")"
+  open "$(dirname "$DESTINATION_FILE_ABS_PATH")"
+}
+
+function main() {
+  import_variables
+  launch_vpn_service_if_needed
+  connect_to_vpn_if_needed
+  mount_fileshare_if_needed
+  copy_file
+  unmount_fileshare
+  close_vpn_connection
+  open_destination_folder
+}
+
+main

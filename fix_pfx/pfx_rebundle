@@ -1,0 +1,122 @@
+#!/bin/bash
+
+############################################################
+#                                                          #
+#  Name:           fix_pfx                                 #
+#                                                          #
+#  Description:    Re-bundle PKCS 12 pfx file with         #
+#                  Jamf-compatible algorithm               #
+#                                                          #
+#  Arguments:      None                                    #
+#                                                          #
+#  Version:        1.0                                     #
+#                                                          #
+#  Last Edited By: greg.sheppard@zones.com                 #
+#                                                          #
+#  Date:           2021-02-10                              #
+#                                                          #
+#  Instructions:   Place incompatible pfx file and a text  #
+#                  file named 'password' containing the    #
+#                  password in same directory as script    #
+#                  and execute.                            #
+#                                                          #
+############################################################
+
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin
+
+function start_from_script_directory() {
+  local SCRIPT_DIR
+  SCRIPT_DIR="$(dirname "$0")"
+  cd "$SCRIPT_DIR" || {
+    echo "ERROR: could not enter script directory '$SCRIPT_DIR'" >&2
+    exit 1
+  }
+}
+
+function get_input_pfx_filename() {
+  pwd
+  for file in *; do
+    if [[ "$file" =~ pfx$ && ! "$file" =~ -out ]]; then
+      if [[ -z "$INPUT_PFX_FILE" ]]; then
+        INPUT_PFX_FILE="$file"
+      else
+        msg="too many pfx files in the input directory "
+        msg+="(output file doesn't count)"
+        echo "ERROR: $msg" >&2
+        exit 1
+      fi
+    fi
+  done
+  if [[ -z "$INPUT_PFX_FILE" ]]; then
+    echo "no input pfx file found in script directory" >&2
+    exit 1
+  else
+    echo "using '$INPUT_PFX_FILE' as input pfx file"
+  fi
+}
+
+function assign_variables() {
+  PASSWORD="$(<password)"
+  KEY_FILE="${INPUT_PFX_FILE/.pfx/.key}"
+  CLIENT_CERT_FILE="${INPUT_PFX_FILE/.pfx/-client.crt}"
+  CA_CERT_FILE="${INPUT_PFX_FILE/.pfx/-CA.crt}"
+  OUTPUT_FILE="${INPUT_PFX_FILE/.pfx/-out.pfx}"
+}
+
+function extract_client_certificate() {
+  openssl pkcs12 \
+    -in "$INPUT_PFX_FILE" \
+    -clcerts \
+    -nokeys \
+    -passin "pass:$PASSWORD" \
+    -out "$CLIENT_CERT_FILE"
+}
+
+function extract_authority_certificates() {
+  openssl pkcs12 \
+    -in "$INPUT_PFX_FILE" \
+    -cacerts \
+    -nokeys \
+    -passin "pass:$PASSWORD" \
+    -out "$CA_CERT_FILE"
+}
+
+function extract_private_key() {
+  openssl pkcs12 \
+    -in "$INPUT_PFX_FILE" \
+    -nocerts \
+    -passin "pass:$PASSWORD" \
+    -passout "pass:$PASSWORD" \
+    -out "$KEY_FILE"
+}
+
+function rebundle_pfx_file() {
+  openssl pkcs12 \
+    -export \
+    -out "$OUTPUT_FILE" \
+    -inkey "$KEY_FILE" \
+    -in "$CLIENT_CERT_FILE" \
+    -CAfile "$CA_CERT_FILE" \
+    -passin "pass:$PASSWORD" \
+    -passout "pass:$PASSWORD" \
+    -chain
+}
+
+function clean_up() {
+  rm "$KEY_FILE" \
+    "$CLIENT_CERT_FILE" \
+    "$CA_CERT_FILE"
+}
+
+function main() {
+  start_from_script_directory
+  get_input_pfx_filename
+  assign_variables
+  extract_client_certificate
+  extract_authority_certificates
+  extract_private_key
+  rebundle_pfx_file
+  clean_up
+}
+
+main
